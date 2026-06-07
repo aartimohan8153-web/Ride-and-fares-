@@ -1,0 +1,144 @@
+# ==========================================
+# IMPORTS: Bringing in the tools we need
+# ==========================================
+import pandas as pd # Used for data manipulation and creating DataFrames (think of these like Excel tables)
+import numpy as np # Used for fast numerical operations and generating random numbers
+from sklearn.model_selection import train_test_split # Splits our data so we can test the model on unseen data
+from sklearn.linear_model import LinearRegression # The fundamental machine learning algorithm we are training
+from sklearn.metrics import mean_absolute_error # The scoring metric (how many dollars off is our prediction on average?)
+from datetime import datetime, timedelta # Used to handle, create, and manipulate dates and times
+
+# ==========================================
+# 1. Generate a Synthetic Ride-Share Dataset
+# ==========================================
+# We set a seed so that every time you run this code, you get the exact same "random" numbers.
+np.random.seed(42)
+num_records = 5000 # We are simulating 5,000 individual taxi/Uber rides
+
+# Simulate pickup locations (Latitude and Longitude roughly around a city center)
+pickup_lats = np.random.uniform(40.6, 40.9, num_records)
+pickup_lons = np.random.uniform(-74.0, -73.7, num_records)
+
+# Simulate dropoff locations by adding a tiny random variation to the pickup spots
+dropoff_lats = pickup_lats + np.random.normal(0, 0.05, num_records)
+dropoff_lons = pickup_lons + np.random.normal(0, 0.05, num_records)
+
+# Generate 5,000 random timestamps spread across a 30-day period starting from June 1, 2026
+start_date = datetime(2026, 6, 1)
+timestamps = [start_date + timedelta(days=np.random.randint(0, 30), 
+                                     hours=np.random.randint(0, 24), 
+                                     minutes=np.random.randint(0, 60)) 
+              for _ in range(num_records)]
+
+# Combine all these separate lists into a single pandas DataFrame (our raw dataset)
+df = pd.DataFrame({
+    'pickup_datetime': timestamps,
+    'pickup_lat': pickup_lats,
+    'pickup_lon': pickup_lons,
+    'dropoff_lat': dropoff_lats,
+    'dropoff_lon': dropoff_lons,
+    'passenger_count': np.random.randint(1, 5, num_records) # Random 1 to 4 passengers
+})
+
+# --- Creating the "Target" Variable (What we want to predict) ---
+# To test our model, we need to create realistic fare prices based on strict rules.
+# First, we calculate a rough mathematical distance using the Pythagorean theorem.
+df['true_distance'] = np.sqrt((df['pickup_lat'] - df['dropoff_lat'])**2 + 
+                              (df['pickup_lon'] - df['dropoff_lon'])**2) * 69 
+
+# Extract just the hour to figure out if the ride happened during a busy time
+df['hour'] = df['pickup_datetime'].dt.hour
+df['is_rush'] = ((df['hour'] >= 7) & (df['hour'] <= 9)) | ((df['hour'] >= 16) & (df['hour'] <= 18))
+
+# Calculate the final realistic fare: $3.50 base + $2.50 per mile + $5.00 rush hour fee + some random noise
+df['fare_amount'] = 3.50 + (df['true_distance'] * 2.50) + (df['is_rush'] * 5.00) + np.random.normal(0, 2, num_records)
+
+# We drop these calculation columns. We want our ML model to figure this out on its own!
+df = df.drop(columns=['true_distance', 'hour', 'is_rush'])
+
+
+# ==========================================
+# 2. Baseline Model (The "Bad" Approach)
+# ==========================================
+print("--- Training Baseline Model on Raw Data ---")
+
+# We define X (our features/inputs) and y (our target/output).
+# We skip 'pickup_datetime' because a basic Linear Regression model cannot read a date object directly.
+X_baseline = df[['pickup_lat', 'pickup_lon', 'dropoff_lat', 'dropoff_lon', 'passenger_count']]
+y = df['fare_amount']
+
+# Split the data: 80% used to train the model, 20% held back to test it later.
+X_train_b, X_test_b, y_train, y_test = train_test_split(X_baseline, y, test_size=0.2, random_state=42)
+
+# Create the model, train it (fit), and make predictions on the 20% test data.
+baseline_model = LinearRegression()
+baseline_model.fit(X_train_b, y_train)
+baseline_predictions = baseline_model.predict(X_test_b)
+
+# Check the error: How far off were our predictions from the actual 'fare_amount'?
+baseline_mae = mean_absolute_error(y_test, baseline_predictions)
+
+print(f"Baseline Mean Absolute Error: ${baseline_mae:.2f}")
+print("Notice how bad this is. The model doesn't understand what raw map coordinates actually mean.\n")
+
+
+# ==========================================
+# 3. Feature Engineering Engine (The Fix)
+# ==========================================
+print("--- Engineering New Features ---")
+
+# Make a copy of the dataset so we don't mess up our original raw data
+df_engineered = df.copy()
+
+# A. Haversine Distance
+# Instead of giving the model raw GPS coordinates, we write a function that uses 
+# trigonometry to calculate the actual physical distance between the two points on Earth.
+def haversine(lat1, lon1, lat2, lon2):
+    R = 3958.8 # Earth's radius in miles
+    lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2]) # Convert degrees to radians
+    dlat = lat2 - lat1
+    dlon = lon2 - lon1
+    a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+    c = 2 * np.arcsin(np.sqrt(a))
+    return R * c # Returns the actual distance in miles
+
+# Apply our function to create a brand new, highly useful column!
+df_engineered['trip_distance_miles'] = haversine(df_engineered['pickup_lat'], 
+                                                 df_engineered['pickup_lon'], 
+                                                 df_engineered['dropoff_lat'], 
+                                                 df_engineered['dropoff_lon'])
+
+# B. Temporal Features
+# We break down the unreadable datetime object into simple numbers the model can understand.
+df_engineered['hour_of_day'] = df_engineered['pickup_datetime'].dt.hour
+df_engineered['day_of_week'] = df_engineered['pickup_datetime'].dt.dayofweek
+
+# C. Rush Hour Flag
+# We create a simple Yes/No (1 or 0) column to explicitly tell the model if it's peak traffic time.
+df_engineered['is_rush_hour'] = ((df_engineered['hour_of_day'] >= 7) & (df_engineered['hour_of_day'] <= 9)) | \
+                                ((df_engineered['hour_of_day'] >= 16) & (df_engineered['hour_of_day'] <= 18))
+df_engineered['is_rush_hour'] = df_engineered['is_rush_hour'].astype(int) # Converts True/False to 1/0
+
+# We set up our new X variable using ONLY the smart features we just created.
+X_engineered = df_engineered[['trip_distance_miles', 'hour_of_day', 'day_of_week', 'is_rush_hour', 'passenger_count']]
+
+
+# ==========================================
+# 4. Improved Model
+# ==========================================
+print("--- Training Improved Model on Engineered Features ---")
+
+# Split our newly engineered data (80% train, 20% test)
+X_train_e, X_test_e, y_train, y_test = train_test_split(X_engineered, y, test_size=0.2, random_state=42)
+
+# Train a brand new Linear Regression model on the smart features and make predictions
+improved_model = LinearRegression()
+improved_model.fit(X_train_e, y_train)
+improved_predictions = improved_model.predict(X_test_e)
+
+# Score the new model
+improved_mae = mean_absolute_error(y_test, improved_predictions)
+
+# Print the final results to prove that feature engineering works!
+print(f"Improved Mean Absolute Error: ${improved_mae:.2f}")
+print(f"Improvement: You saved the company ${baseline_mae - improved_mae:.2f} per prediction error!")
